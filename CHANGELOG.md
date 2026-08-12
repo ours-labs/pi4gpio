@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added bus-free native protocol version and capability negotiation without changing existing version 1 hardware requests.
+- Added a machine-readable pigpiod command support matrix that makes no compatibility claim until conformance tests exist.
+
 ## 0.1.2 - 2026-07-29
 
 - Prevented a second daemon from deleting the Unix socket of a running daemon.

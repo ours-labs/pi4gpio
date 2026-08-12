@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "compatibility_target": "pigpiod",
+  "compatibility_claim": "none",
+  "statuses": [
+    "not_implemented",
+    "implemented",
+    "conformant"
+  ],
+  "commands": [
+    {"name": "MODES", "number": 0, "status": "not_implemented", "test": null},
+    {"name": "MODEG", "number": 1, "status": "not_implemented", "test": null},
+    {"name": "PUD", "number": 2, "status": "not_implemented", "test": null},
+    {"name": "READ", "number": 3, "status": "not_implemented", "test": null},
+    {"name": "WRITE", "number": 4, "status": "not_implemented", "test": null},
+    {"name": "PWM", "number": 5, "status": "not_implemented", "test": null},
+    {"name": "PRS", "number": 6, "status": "not_implemented", "test": null},
+    {"name": "PFS", "number": 7, "status": "not_implemented", "test": null},
+    {"name": "SERVO", "number": 8, "status": "not_implemented", "test": null},
+    {"name": "TICK", "number": 16, "status": "not_implemented", "test": null},
+    {"name": "HWVER", "number": 17, "status": "not_implemented", "test": null},
+    {"name": "NO", "number": 18, "status": "not_implemented", "test": null}
+  ]
+}

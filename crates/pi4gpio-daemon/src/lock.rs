@@ -1,13 +1,6 @@
-//! バス単位・トランザクション単位のロック機構。
+//! Per-bus lock ownership for multiplexing multiple daemon clients.
 //!
-//! 複数クライアントが1つのデーモンを安全に共有するため、resource ownershipを
-//! connection単位で追跡する。
-//!
-//! TODO: 優先度付け・タイムアウト・デッドロック回避。
-//!
-//! クライアント切断時の自動解放は、`socket.rs`の接続ハンドラが保持中の
-//! `BusId`集合を追跡し、ループ終了時（正常/異常問わず）に`release`を
-//! 呼ぶことで実現している。
+//! Locks are released explicitly or when the owning client disconnects.
 
 use crate::client::ClientId;
 use std::collections::HashMap;
@@ -31,7 +24,6 @@ impl LockTable {
         Self::default()
     }
 
-    /// 既に他クライアントが保持している場合は、保持者の`ClientId`を返す。
     pub fn try_acquire(&self, bus: BusId, client: ClientId) -> Result<(), ClientId> {
         let mut holders = self.holders.lock().expect("lock table poisoned");
         match holders.get(&bus) {
@@ -43,9 +35,6 @@ impl LockTable {
         }
     }
 
-    /// 所有者だけがロックを解放できる。`before_unlock`は所有者確認後、ロックを
-    /// 他クライアントへ明け渡す前に実行する。ハードウェアハンドルのdropをここで
-    /// 行うことで、次クライアントが古いFDを再利用する競合窓を作らない。
     pub fn release_with<F>(&self, bus: BusId, client: &ClientId, before_unlock: F) -> bool
     where
         F: FnOnce(),
@@ -153,7 +142,6 @@ mod tests {
         for bus in held {
             assert_eq!(locks.try_acquire(bus, disconnected.clone()), Ok(()));
         }
-        // socket.rsの切断処理と同じく、接続が追跡していた全BusIdを解放する。
         for bus in held {
             assert!(locks.release_with(bus, &disconnected, || {}));
         }

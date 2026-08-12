@@ -1,9 +1,8 @@
-//! クライアント識別。
+//! Local client identity.
 //!
-//! ローカルソケット接続では`SO_PEERCRED`（UID/PID）とdaemon内で一意な
-//! セッション番号を識別子として使う。同じプロセスが再接続した場合も古い接続と
-//! 新しい接続を区別し、古い接続の切断cleanupが新しい接続のロックを解放しない。
-//! リモート経路（Tailscale限定bind＋APIキー）が有効な場合はAPIキーを識別子にする。
+//! Each connection uses `SO_PEERCRED` (UID/PID) plus a daemon-local session
+//! number. The session number prevents cleanup from an older connection from
+//! releasing resources acquired after the same process reconnects.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,17 +12,7 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientId {
-    Local {
-        uid: u32,
-        pid: u32,
-        session_id: u64,
-    },
-    // NETWORK_POLICY.mdのTailscale限定bind＋APIキー実装まで未使用。
-    #[allow(dead_code)]
-    Remote {
-        api_key_id: String,
-        session_id: u64,
-    },
+    Local { uid: u32, pid: u32, session_id: u64 },
 }
 
 impl ClientId {

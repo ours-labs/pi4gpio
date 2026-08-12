@@ -1,14 +1,4 @@
-//! `pi4gpio-hw`のSPI実装を実機で手動検証するためのサンプル。
-//! CIでは実行できない（実ハードウェアが必要）。
-//!
-//! Sends an MCP3208 channel-read command (`[cmd1, cmd2, 0]`) and prints
-//! 同じ`[cmd1, cmd2, 0]`）を送り、受信バイト列を表示する。SPIはI2Cと
-//! 違いACK/NACKが無いため「応答がある/ない」で正誤判定はできない。
-//! センサー基盤が物理的に未接続の場合と、実際に正しく動いている場合を
-//! 区別するには、同じコマンドをPython(spidev)側でも実行し受信バイト列を
-//! 突き合わせるのが確実——この実行結果は別途Python側と比較する。
-//!
-//! 使い方: cargo run --release --example spi_smoke_test -- <bus> <chip_select> <channel>
+//! Manual SPI transfer smoke test using an MCP3208-compatible command.
 
 use pi4gpio_hw::spi::SpiDevice;
 use std::process::ExitCode;
@@ -32,7 +22,6 @@ fn main() -> ExitCode {
         }
     };
 
-    // MCP3208 single-channel read command.
     let cmd1 = 0x06 | (channel >> 2);
     let cmd2 = (channel & 3) << 6;
     let tx = [cmd1, cmd2, 0];

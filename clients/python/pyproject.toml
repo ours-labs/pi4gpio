@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "pi4gpio-client"
 version = "0.1.1"
 description = "Python client for the local pi4gpiod Unix-socket API"
-authors = [{name = "Kazuki Kumahata"}]
+authors = [{name = "kazuki1729"}]
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"

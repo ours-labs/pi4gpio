@@ -1,12 +1,4 @@
-//! `pi4gpio-hw`のI2C実装を実機で手動検証するためのサンプル。
-//! CIでは実行できない（実ハードウェアが必要）。
-//!
-//! BME280/BMP280のチップIDレジスタ（0xD0、読み取り専用・副作用なし）を
-//! `write_read`で読み、レジスタポインタ書き込み＋リピートスタート読み取りの
-//! 結合トランザクションが正しく動くかを検証する。センサーが物理的に未接続
-//! でも安全（NACK/タイムアウトがエラーとして返るだけ）。
-//!
-//! 使い方: cargo run --release --example i2c_smoke_test -- <bus>
+//! Manual I2C combined-transaction smoke test against a read-only chip ID.
 
 use pi4gpio_hw::i2c::I2cBus;
 use std::process::ExitCode;
@@ -14,7 +6,6 @@ use std::process::ExitCode;
 const CHIP_ID_REG: u8 = 0xd0;
 const BME280_ID: u8 = 0x60;
 const BMP280_ID: u8 = 0x58;
-/// BME280/BMP280が取りうる代表的な2アドレス。
 const CANDIDATE_ADDRS: [u8; 2] = [0x76, 0x77];
 
 fn main() -> ExitCode {
@@ -37,7 +28,7 @@ fn main() -> ExitCode {
     let mut found_any = false;
 
     for addr in CANDIDATE_ADDRS {
-        println!("[addr=0x{addr:02x}] write_read([0xD0], 1) -> チップIDレジスタ");
+        println!("[addr=0x{addr:02x}] write_read([0xD0], 1) -> chip ID register");
         let mut id = [0u8; 1];
         match bus.write_read(addr, &[CHIP_ID_REG], &mut id) {
             Ok(()) => {
@@ -50,20 +41,16 @@ fn main() -> ExitCode {
                 found_any = true;
             }
             Err(err) => {
-                println!("  応答なし（未接続の可能性）: {err}");
+                println!("  no response (device may be disconnected): {err}");
             }
         }
     }
 
     if found_any {
-        println!("すべて成功（結合トランザクションが正しく動作）");
+        println!("all checks passed (combined transaction works)");
         ExitCode::SUCCESS
     } else {
-        println!(
-            "どちらのアドレスにも応答なし。物理的に未接続の可能性が高い（本番ログの既知の事象と一致）"
-        );
-        // センサー未接続はテスト失敗ではない（write_read自体は正しくエラーを
-        // 返せている）ため、成功として終了する。
+        println!("neither address responded; the device is probably disconnected");
         ExitCode::SUCCESS
     }
 }

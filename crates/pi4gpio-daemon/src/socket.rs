@@ -1,7 +1,4 @@
-//! Unixドメインソケットサーバ。
-//!
-//! NETWORK_POLICY.mdの決定に基づき、この段階ではローカルソケットのみを実装対象と
-//! する。Tailscale限定bindは実際にリモート制御が必要になった時点で追加する。
+//! Local Unix-domain socket server.
 
 use crate::client::ClientId;
 use crate::config::Config;
@@ -26,18 +23,10 @@ use tokio::signal::unix::{signal, SignalKind};
 
 const GPIOCHIP_PATH: &str = "/dev/gpiochip0";
 
-/// I2Cバスはリクエストで指定された`bus`番号ごとに初回アクセス時に開く
-/// （`/dev/i2c-0`と`/dev/i2c-1`の両方が存在しうるため、GPIOのようにプロセス
-/// 起動時点で単一インスタンスを確保する構成にできない）。
 type I2cBuses = HashMap<u8, I2cBus>;
-/// SPIも同様に`(bus, chip_select)`ごとに初回アクセス時に開く。
 type SpiDevices = HashMap<(u8, u8), SpiDevice>;
-/// UARTも同様に`port`番号ごとに初回アクセス時に開く。`port`は
-/// `/dev/ttyS{port}`に対応する（daemon側の命名規約）。
 type UartPorts = HashMap<u8, UartPort>;
 
-/// 遅延openしたデバイスハンドルのキャッシュ。値型をジェネリックにしているのは、
-/// 実デバイスなしの単体テストでもdropを検証できるようにするため。
 struct PeripheralHandles<I, S, U> {
     i2c: Mutex<HashMap<u8, I>>,
     spi: Mutex<HashMap<(u8, u8), S>>,
@@ -55,8 +44,6 @@ impl<I, S, U> Default for PeripheralHandles<I, S, U> {
 }
 
 impl<I, S, U> PeripheralHandles<I, S, U> {
-    /// 対応するキャッシュ要素をremoveし、その場でdropする。GPIOはdaemonの
-    /// `/dev/gpiomem`マッピングを共有するため、ピン単位Releaseの対象外。
     fn close(&self, bus: BusId) -> bool {
         match bus {
             BusId::Gpio(_) => false,
@@ -82,8 +69,6 @@ impl<I, S, U> PeripheralHandles<I, S, U> {
     }
 }
 
-/// 各バス種別のハードウェア状態をまとめて保持する。ハンドラ関数の引数が
-/// バス種別の数だけ増え続けるのを避けるための1つの塊として扱う。
 struct Peripherals {
     locks: LockTable,
     gpio: Mutex<GpioChip>,
@@ -166,12 +151,6 @@ async fn handle_client(stream: UnixStream, peripherals: Arc<Peripherals>) -> io:
 
     let result = process_requests(reader, writer, &client_id, &peripherals, &mut held_buses).await;
 
-    // process_requestsがEOF（Ok）で終わってもI/Oエラー（Err、例えば
-    // クライアントが強制切断されたことによるBroken pipe）で終わっても、
-    // 保持中のロックは必ず解放する。以前は`?`によるアーリーリターンで
-    // このブロック自体がスキップされることがあり、通信エラーで切断した
-    // クライアントのロックが解放されないまま残ってしまうバグがあった
-    // This also covers I/O-error exits so stale ownership cannot survive a disconnect.
     let buses: Vec<_> = held_buses.iter().copied().collect();
     for bus in buses {
         release_owned_bus(
@@ -202,10 +181,6 @@ async fn process_requests(
 
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
-                // Tier 2のWatchEdgesは最大で数十ミリ秒ブロックしうる
-                // （Tier 1の各操作はマイクロ秒オーダーで無視できる差だが、
-                // これは無視できない）。tokioのワーカースレッドを塞がない
-                // よう、実際のディスパッチはブロッキングスレッドプールで行う。
                 let peripherals = Arc::clone(peripherals);
                 let client_id = client_id.clone();
                 let mut held = std::mem::take(held_buses);
@@ -239,7 +214,20 @@ fn dispatch(
     if let Err(error) = request.validate() {
         return Response::malformed(&error);
     }
-    let bus: BusId = (&request.bus).into();
+
+    if let Operation::Hello {
+        protocol_versions,
+        requested_capabilities,
+    } = &request.op
+    {
+        return Response::hello(protocol_versions, requested_capabilities);
+    }
+
+    let bus_ref = request
+        .bus
+        .as_ref()
+        .expect("validated hardware request must contain bus");
+    let bus: BusId = bus_ref.into();
 
     if matches!(request.op, Operation::Release) {
         release_owned_bus(
@@ -261,7 +249,7 @@ fn dispatch(
         }
     }
 
-    match &request.bus {
+    match bus_ref {
         BusRef::Gpio { pin } => handle_gpio(*pin, &request.op, &peripherals.gpio),
         BusRef::I2c { bus, addr } => handle_i2c(*bus, *addr, &request.op, &peripherals.handles.i2c),
         BusRef::Spi { bus, chip_select } => {
@@ -273,9 +261,6 @@ fn dispatch(
     }
 }
 
-/// セッションが実際に保持しているバスだけを解放する。`LockTable`が所有者を
-/// 再確認した状態でキャッシュをdropし、その後にロックを削除するため、非所有者の
-/// Releaseや次クライアントとの競合で使用中FDを閉じることはない。
 fn release_owned_bus<I, S, U>(
     locks: &LockTable,
     handles: &PeripheralHandles<I, S, U>,
@@ -352,20 +337,15 @@ fn handle_gpio(pin: u32, op: &Operation, gpio: &Mutex<GpioChip>) -> Response {
         Operation::ReadBytes { .. }
         | Operation::WriteBytes { .. }
         | Operation::WriteReadBytes { .. }
-        | Operation::Transfer { .. } => Response::malformed("gpioバスにはバイト列操作は使えません"),
-        Operation::Release => unreachable!("Releaseはdispatchの時点で処理済み"),
+        | Operation::Transfer { .. }
+        | Operation::Hello { .. } => {
+            Response::malformed("byte operations are not valid for a GPIO bus")
+        }
+        Operation::Release => unreachable!("Release is handled before dispatch"),
     }
 }
 
-/// スタート信号（任意）を送ってからエッジを記録する（Tier 2、DHT22向け）。
-///
-/// `pre_pulse_low_ms`が指定されていれば、`/dev/gpiomem`経由（Tier 1、
-/// `gpio.rs`）でピンをLOW出力にしてから待ち、その後`/dev/gpiochip0`経由
-/// （Tier 2、`gpio_watch.rs`）に切り替えてエッジ監視を開始する。両者は
-/// カーネルのピン使用状況把握という点で別経路のため、この切り替え自体は
-/// カーネル側の衝突検知（EBUSY）の対象にならない（`gpio_watch.rs`のモジュール
-/// docを参照）。このピンの`LockTable`ロックは呼び出し元がスタート信号から
-/// 監視終了まで保持しているため、他クライアントの割り込みは防がれている。
+/// Capture timestamped GPIO edges through the kernel event interface.
 fn handle_watch_edges(
     pin: u32,
     pre_pulse_low_ms: Option<u64>,
@@ -379,7 +359,7 @@ fn handle_watch_edges(
         let result = chip
             .claim_output(pin)
             .and_then(|()| chip.write(pin, Level::Low));
-        drop(chip); // sleep中は他バスのGPIO操作をブロックしない。
+        drop(chip);
         if let Err(err) = result {
             return Response::hw_error(&err.to_string());
         }
@@ -401,11 +381,6 @@ fn handle_watch_edges(
     }
 }
 
-/// `WatchEdges`（カーネルGPIO v2エッジ割り込み）の代替。割り込みに
-/// 頼らず、`/dev/gpiomem`の生レベルを高速busy-loopで連続サンプリングし、
-/// レベルが変化した瞬間をエッジとして記録する。終了判定は反復回数ではなく
-/// 呼び出し側が指定した実時間を使うため、信号プロトコルやCPU速度へ固定されない。
-/// 戻り値の形式（`edges`）は`WatchEdges`と同一。
 fn handle_watch_edges_polled(
     pin: u32,
     pre_pulse_low_ms: Option<u64>,
@@ -544,10 +519,11 @@ fn handle_i2c(bus_num: u8, addr: u8, op: &Operation, i2c: &Mutex<I2cBuses>) -> R
         | Operation::Write { .. }
         | Operation::Transfer { .. }
         | Operation::WatchEdges { .. }
-        | Operation::WatchEdgesPolled { .. } => {
-            Response::malformed("i2cバスにはこの操作は使えません")
+        | Operation::WatchEdgesPolled { .. }
+        | Operation::Hello { .. } => {
+            Response::malformed("this operation is not valid for an I2C bus")
         }
-        Operation::Release => unreachable!("Releaseはdispatchの時点で処理済み"),
+        Operation::Release => unreachable!("Release is handled before dispatch"),
     }
 }
 
@@ -575,10 +551,11 @@ fn handle_spi(bus_num: u8, chip_select: u8, op: &Operation, spi: &Mutex<SpiDevic
         | Operation::WriteBytes { .. }
         | Operation::WriteReadBytes { .. }
         | Operation::WatchEdges { .. }
-        | Operation::WatchEdgesPolled { .. } => {
-            Response::malformed("spiバスにはこの操作は使えません")
+        | Operation::WatchEdgesPolled { .. }
+        | Operation::Hello { .. } => {
+            Response::malformed("this operation is not valid for an SPI bus")
         }
-        Operation::Release => unreachable!("Releaseはdispatchの時点で処理済み"),
+        Operation::Release => unreachable!("Release is handled before dispatch"),
     }
 }
 
@@ -610,10 +587,11 @@ fn handle_uart(port: u8, baud_rate: u32, op: &Operation, uart: &Mutex<UartPorts>
         | Operation::WriteReadBytes { .. }
         | Operation::Transfer { .. }
         | Operation::WatchEdges { .. }
-        | Operation::WatchEdgesPolled { .. } => {
-            Response::malformed("uartバスにはこの操作は使えません")
+        | Operation::WatchEdgesPolled { .. }
+        | Operation::Hello { .. } => {
+            Response::malformed("this operation is not valid for a UART bus")
         }
-        Operation::Release => unreachable!("Releaseはdispatchの時点で処理済み"),
+        Operation::Release => unreachable!("Release is handled before dispatch"),
     }
 }
 
@@ -761,7 +739,6 @@ mod tests {
         let owner = client(10, 1);
         let contender = client(20, 2);
         let bus = BusId::Uart(0);
-        // 不整合なheld集合まで想定し、LockTable側の所有者確認も検証する。
         let mut contender_held = HashSet::from([bus]);
 
         handles

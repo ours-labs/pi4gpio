@@ -1,7 +1,4 @@
-//! BCM2711 (Raspberry Pi 4) のハードウェアレジスタに直接触れる層。
-//!
-//! `unsafe`を要する操作をこのクレートに局所化し、`pi4gpio-daemon`側は
-//! 安全なRustのみで書く。
+//! Hardware access primitives for Raspberry Pi 4 GPIO, I2C, SPI, and UART.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod error;

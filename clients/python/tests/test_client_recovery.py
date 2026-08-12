@@ -1,4 +1,4 @@
-"""デーモン停止・再起動時のクライアント復旧に関する障害注入テスト。"""
+"""Fault-injection tests for client recovery across daemon interruptions."""
 
 import collections
 import json
@@ -10,7 +10,7 @@ from pi4gpio_client import Pi4gpioClient, Pi4gpioConnectionError
 
 
 class _SocketSequenceClient(Pi4gpioClient):
-    """接続試行ごとに、準備済みソケットまたは例外を返すテスト用クライアント。"""
+    """Return a prepared socket or exception for each connection attempt."""
 
     def __init__(self, sequence):
         super().__init__(
@@ -35,7 +35,7 @@ class _SocketSequenceClient(Pi4gpioClient):
 
 
 def _drop_after_one_request(server_sock):
-    """要求を受信した直後に応答せず接続を切り、デーモン異常終了を模擬する。"""
+    """Close after receiving a request to simulate a daemon failure."""
     with server_sock:
         reader = server_sock.makefile("rb")
         reader.readline()
@@ -70,8 +70,7 @@ class ClientRecoveryFaultInjectionTest(unittest.TestCase):
             self.assertTrue(caught.exception.reconnected)
             self.assertEqual(client.connection_attempts, 1)
 
-            # 最初の要求がdaemon側で実行済みかは判別不能である。再接続先へ
-            # 自動再送されていないことを、受信タイムアウトで直接確認する。
+            # Execution status is unknown, so verify that no automatic retry occurs.
             new_server.settimeout(0.05)
             with self.assertRaises((TimeoutError, socket.timeout)):
                 new_server.recv(1)

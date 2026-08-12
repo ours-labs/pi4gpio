@@ -1,8 +1,7 @@
-//! 設定読み込み。
+//! Local daemon configuration.
 //!
-//! 雛形段階では環境変数のみに対応。
-//! TODO: 設定ファイルからの読み込み、Tailscale限定bindオプション、
-//! APIキー設定（NETWORK_POLICY.md）を実装する。
+//! The public transport is a Unix-domain socket. Network configuration is not
+//! part of the current protocol or security boundary.
 
 const DEFAULT_SOCKET_PATH: &str = "/run/pi4gpio/pi4gpio.sock";
 const SOCKET_PATH_ENV: &str = "PI4GPIO_SOCKET_PATH";

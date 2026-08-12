@@ -1,19 +1,13 @@
-"""pi4gpiodへのUnixソケット経由クライアント。
+"""Unix-socket client for pi4gpiod.
 
-改行区切りJSON（NDJSON）プロトコルでpi4gpiodと通信する。プロトコル定義は
-pi4gpioリポジトリの`crates/pi4gpio-daemon/src/protocol.rs`が正本。
+The client uses a newline-delimited JSON (NDJSON) protocol. The canonical
+definition lives in ``crates/pi4gpio-daemon/src/protocol.rs``. Pi4gpio exposes
+generic GPIO, I2C, SPI, and UART primitives; sensor-specific calibration and
+decoding remain the caller's responsibility.
 
-BME280のキャリブレーション計算・DHT22の40ビットデコードのようなセンサー
-固有のロジックはこのクライアントの責務ではない。pi4gpiodは汎用バス
-プリミティブ（GPIO/I2C/SPI/UARTの生の読み書き）のみを提供する設計で、
-センサー固有の解釈は呼び出し側に残る。
-
-`bus`（`BusRef`）と`op`（`Operation`）はserdeでのタグ付け方式が異なる点に
-注意。`BusRef`は`#[serde(tag = "type")]`で内部タグ付き
-（例: ``{"type": "gpio", "pin": 17}``）だが、`Operation`にはタグ属性が無く
-serdeのデフォルト（外部タグ付き）になる。データを持たないバリアント
-（`Release`）は裸の文字列（例: ``"release"``）、データを持つバリアント
-は1キーのオブジェクト（例: ``{"write": {"value": true}}``）で表現される。
+``BusRef`` is internally tagged with ``type`` while ``Operation`` uses serde's
+external tagging. Unit variants are strings and variants with data are
+single-key objects.
 """
 
 from __future__ import annotations
@@ -26,21 +20,20 @@ from typing import Any, BinaryIO, Optional
 
 DEFAULT_SOCKET_PATH = "/run/pi4gpio/pi4gpio.sock"
 
-# daemon側の待ち時間（timeout_ms/budget_ms）に対してソケットタイムアウトを
-# 引き上げる際の安全マージン。ネットワーク・プロセス間のオーバーヘッド分。
+# Safety margin for daemon-side timeout and budget values.
 _RESPONSE_TIMEOUT_MARGIN_SEC = 2.0
 
 
 class Pi4gpioError(Exception):
-    """pi4gpiodがエラーレスポンス（``ok: false``）を返した場合に送出する。"""
+    """Raised when pi4gpiod returns an error response (``ok: false``)."""
 
 
 class Pi4gpioConnectionError(Pi4gpioError):
-    """pi4gpiodとの通信が切断された場合に送出する。
+    """Raised when communication with pi4gpiod is interrupted.
 
-    ``reconnected``が真なら、新しい接続の確立までは完了している。ただし、
-    切断時に処理中だった要求は二重実行を避けるため自動再送しない。呼び出し側は
-    この例外をその周期の失敗として扱い、次の通常周期で操作を再実行する。
+    If ``reconnected`` is true, a new connection has been established. The
+    in-flight request is never retried automatically because its execution
+    status is unknown.
     """
 
     def __init__(self, message: str, *, reconnected: bool) -> None:
@@ -49,14 +42,10 @@ class Pi4gpioConnectionError(Pi4gpioError):
 
 
 class Pi4gpioClient:
-    """pi4gpiodへの1接続を表すクライアント。
+    """Represent one connection to pi4gpiod.
 
-    バスのロックは接続単位で保持される（サーバー側の`LockTable`参照）ため、
-    同じ接続を使い回している限り、確保したバスは他クライアントの割り込み
-    から守られる。明示的に`*_release()`を呼ぶか、接続を閉じる（`close()`
-    または`with`ブロックを抜ける）とロックが解放される。
-
-    with文での利用を想定している::
+    Bus locks are held per connection and released by ``*_release()`` or when
+    the connection is closed. The client supports use as a context manager::
 
         with Pi4gpioClient() as client:
             client.gpio_write(pin=17, value=True)
@@ -73,12 +62,12 @@ class Pi4gpioClient:
         reconnect_max_delay: float = 1.0,
     ):
         if reconnect_attempts < 1:
-            raise ValueError("reconnect_attemptsは1以上である必要があります")
+            raise ValueError("reconnect_attempts must be at least 1")
         if reconnect_initial_delay < 0 or reconnect_max_delay < 0:
-            raise ValueError("再接続待ち時間は0以上である必要があります")
+            raise ValueError("reconnect delays must be non-negative")
         if reconnect_max_delay < reconnect_initial_delay:
             raise ValueError(
-                "reconnect_max_delayはreconnect_initial_delay以上である必要があります"
+                "reconnect_max_delay must be at least reconnect_initial_delay"
             )
         self._socket_path = socket_path
         self._timeout = timeout
@@ -88,8 +77,7 @@ class Pi4gpioClient:
         self._reconnect_max_delay = reconnect_max_delay
         self._sock: Optional[socket.socket] = None
         self._reader: Optional[BinaryIO] = None
-        # 1接続のNDJSON要求/応答は直列である。再接続中に別スレッドが同じ
-        # ソケットを使わないよう、接続状態の変更も同じロックで保護する。
+        # Serialize NDJSON request/response pairs and connection state changes.
         self._request_lock = threading.RLock()
 
     def connect(self) -> "Pi4gpioClient":
@@ -100,7 +88,7 @@ class Pi4gpioClient:
             return self
 
     def _create_connected_socket(self) -> socket.socket:
-        """接続済みソケットを作る。テストではこの境界だけを差し替える。"""
+        """Create a connected socket; tests replace this boundary."""
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.settimeout(self._timeout)
@@ -135,12 +123,12 @@ class Pi4gpioClient:
                     delay = min(delay * 2, self._reconnect_max_delay)
 
         raise Pi4gpioConnectionError(
-            f"pi4gpiodへ接続できませんでした（{attempts}回試行）: {last_error}",
+            f"could not connect to pi4gpiod after {attempts} attempts: {last_error}",
             reconnected=False,
         ) from last_error
 
     def _disconnect(self) -> None:
-        # 先に共有状態から外す。close中に例外が出ても壊れた接続を再利用しない。
+        # Detach shared state first so a failed close cannot reuse the socket.
         reader, self._reader = self._reader, None
         sock, self._sock = self._sock, None
         if reader is not None:
@@ -165,27 +153,21 @@ class Pi4gpioClient:
         self.close()
         return False
 
-    # --- 内部: リクエスト送受信 ---
+    # --- Internal request/response handling ---
 
     def _request(
         self,
-        bus: dict[str, Any],
+        bus: Optional[dict[str, Any]],
         op_name: str,
         op_args: Optional[dict[str, Any]] = None,
         min_response_timeout: Optional[float] = None,
     ) -> dict[str, Any]:
-        """`op_name`は`Operation`のバリアント名（snake_case）、`op_args`は
-        そのバリアントが持つフィールド。`op_args`が`None`なら
-        データを持たないバリアント（`Read`/`Release`）として裸の文字列で
-        送る。
+        """Send one operation and return its decoded response.
 
-        `min_response_timeout`: このリクエストの応答を待つ間だけ、ソケット
-        のタイムアウトを最低でもこの秒数まで一時的に引き上げる（応答後は
-        元の値に戻す）。`gpio_watch_edges`/`gpio_watch_edges_polled`のように
-        呼び出し側がdaemon側の待ち時間（`timeout_ms`/`budget_ms`）を独自に
-        指定できる操作では、それがクライアント自身のソケットタイムアウト
-        （デフォルト5秒）を超えると、daemonが応答するより先にクライアント
-        側がタイムアウトしてしまうことがある（実機検証で発見）。
+        ``op_name`` is the snake_case operation variant and ``op_args`` contains
+        its fields. ``None`` encodes a unit variant as a bare string.
+        ``min_response_timeout`` temporarily raises the socket timeout while
+        waiting for an operation with its own daemon-side time budget.
         """
         with self._request_lock:
             if self._sock is None:
@@ -193,9 +175,10 @@ class Pi4gpioClient:
             assert self._sock is not None and self._reader is not None
 
             op: Any = op_name if op_args is None else {op_name: op_args}
-            payload = (
-                json.dumps({"bus": bus, "op": op}, separators=(",", ":")) + "\n"
-            )
+            request: dict[str, Any] = {"op": op}
+            if bus is not None:
+                request["bus"] = bus
+            payload = json.dumps(request, separators=(",", ":")) + "\n"
 
             request_sock = self._sock
             original_timeout = request_sock.gettimeout()
@@ -210,7 +193,7 @@ class Pi4gpioClient:
                 request_sock.sendall(payload.encode("utf-8"))
                 line = self._reader.readline()
                 if not line:
-                    raise EOFError("空の応答")
+                    raise EOFError("empty response")
                 response: dict[str, Any] = json.loads(line)
             except (OSError, EOFError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._disconnect()
@@ -222,14 +205,14 @@ class Pi4gpioClient:
                     except Pi4gpioConnectionError:
                         pass
 
-                state = "再接続済み" if reconnected else "再接続失敗"
+                state = "reconnected" if reconnected else "reconnection failed"
                 raise Pi4gpioConnectionError(
-                    "pi4gpiodとの通信が切断されました"
-                    f"（{state}）。処理中の要求は安全のため自動再送していません: {exc}",
+                    "communication with pi4gpiod was interrupted "
+                    f"({state}); the in-flight request was not retried: {exc}",
                     reconnected=reconnected,
                 ) from exc
             finally:
-                # 障害時は_disconnect()済みなので、閉じたソケットへ触れない。
+                # A failed request disconnects first, so do not touch that socket.
                 if needs_bump and self._sock is request_sock:
                     try:
                         request_sock.settimeout(original_timeout)
@@ -237,13 +220,34 @@ class Pi4gpioClient:
                         pass
 
             if not response.get("ok", False):
-                raise Pi4gpioError(response.get("error", "不明なエラー"))
+                raise Pi4gpioError(response.get("error", "unknown error"))
             return response
+
+    def protocol_info(
+        self,
+        protocol_versions: tuple[int, ...] = (1,),
+        requested_capabilities: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Negotiate a native protocol version and return daemon capabilities.
+
+        This read-only request is bus-free and does not acquire hardware
+        ownership. Existing v1 hardware request shapes are unchanged.
+        """
+        response = self._request(
+            None,
+            "hello",
+            {
+                "protocol_versions": list(protocol_versions),
+                "requested_capabilities": list(requested_capabilities),
+            },
+        )
+        protocol: dict[str, Any] = response["protocol"]
+        return protocol
 
     # --- GPIO ---
 
     def gpio_read(self, pin: int, pull: str = "none") -> bool:
-        """`pull`は``"none"``/``"up"``/``"down"``のいずれか。"""
+        """Set ``pull`` to ``"none"``, ``"up"``, or ``"down"``."""
         response = self._request(
             {"type": "gpio", "pin": pin}, "read", {"pull": pull}
         )
@@ -263,13 +267,11 @@ class Pi4gpioClient:
         pre_pulse_low_ms: Optional[int] = None,
         pull: str = "none",
     ) -> list[dict[str, Any]]:
-        """エッジをタイムスタンプ付きで記録する（Tier 2）。
+        """Record timestamped edges through the GPIO v2 event interface.
 
-        戻り値は``[{"timestamp_ns": int, "rising": bool}, ...]``。DHT22の
-        40ビットデコード等、センサー固有の解釈は呼び出し側の責務。
-
-        `pull`は``"none"``/``"up"``/``"down"``のいずれか。DHT22モジュールに
-        外部プルアップが無い場合は``"up"``を指定する。
+        Returns ``[{"timestamp_ns": int, "rising": bool}, ...]``. Sensor-specific
+        decoding remains the caller's responsibility. Set ``pull`` to
+        ``"none"``, ``"up"``, or ``"down"`` as required by the circuit.
         """
         response = self._request(
             {"type": "gpio", "pin": pin},
@@ -294,19 +296,14 @@ class Pi4gpioClient:
         idle_timeout_us: int = 300,
         glitch_filter_us: int = 0,
     ) -> list[dict[str, Any]]:
-        """`gpio_watch_edges`（カーネルのGPIO v2エッジ割り込み、Tier 2）の
-        代替。実機検証で、DHT22のような電圧遷移が緩やかなプロトコルでは
-        割り込みが一部の遷移を取りこぼすことがあると判明したため
-        場合があるため、`/dev/gpiomem`の生レベルを
-        daemon側で高速busy-loopポーリングし、レベル変化をエッジとして
-        記録する（Tier 1相当）。戻り値の形式は`gpio_watch_edges`と同一
-        （``[{"timestamp_ns": int, "rising": bool}, ...]``）なので、
-        呼び出し側のデコードロジックはどちらを使っても変更不要。
+        """Record edges by polling raw GPIO levels in the daemon.
 
-        `budget_ms`は最大ポーリング時間、`idle_timeout_us`は最後の遷移から
-        通信終了とみなすまでの無変化時間。`glitch_filter_us`を指定すると、
-        それより短く元のレベルへ戻る変化を除外する。対象信号の仕様が保証する
-        最短パルスより短い値だけを指定する。
+        This alternative to the GPIO v2 event interface is useful for signals
+        whose transitions are not captured reliably by interrupt-driven
+        sampling. Its return format matches ``gpio_watch_edges``. ``budget_ms``
+        limits total polling time, ``idle_timeout_us`` ends capture after
+        inactivity, and ``glitch_filter_us`` rejects shorter round-trip
+        transitions. Keep the filter below the signal's shortest valid pulse.
         """
         response = self._request(
             {"type": "gpio", "pin": pin},
@@ -352,8 +349,7 @@ class Pi4gpioClient:
         return bytes(response.get("bytes") or [])
 
     def i2c_release(self, bus: int) -> None:
-        # ロックはbus単位で管理されaddrは無視されるため（protocol.rsの
-        # From<&BusRef> for BusId参照）、addrはダミー値でよい。
+        # Locks are keyed by bus, so the address is ignored for release.
         self._request({"type": "i2c", "bus": bus, "addr": 0}, "release")
 
     # --- SPI ---

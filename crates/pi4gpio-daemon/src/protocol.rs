@@ -1,22 +1,27 @@
-//! ワイヤープロトコル（雛形段階）。
+//! Newline-delimited JSON protocol shared by the daemon and its clients.
 //!
-//! 改行区切りJSON（1行1リクエスト/1行1レスポンス）。バイナリ化・多重化などの
-//! 最適化は、Tier 1操作が実装されパフォーマンス要件が明確になってから検討する
-//! （現段階ではPythonクライアント側での可読性・実装のしやすさを優先）。
-//!
-//! `Operation`はGPIO用（`Read`/`Write`、1ビット単位）、I2C/UART用
-//! （`ReadBytes`/`WriteBytes`、方向が別々のバイト列。I2Cはさらに結合
-//! トランザクション`WriteReadBytes`を持つ）、SPI用（`Transfer`、送信と
-//! 同時に同じ長さを受信する全二重転送）に分かれる。バスの種類に合わない
-//! 操作が来た場合は`socket.rs`の`dispatch`が`malformed`で拒否する。
-//!
-//! いずれの操作もバスを暗黙に確保する（未確保なら`LockTable::try_acquire`）。
-//! I2Cはバス単位でロックする（`addr`単位ではない）——同じバス上の別デバイス
-//! への割り込みも防ぐのが目的。確保したバスは`Release`または
-//! 切断（`socket.rs`の接続ハンドラ側で処理）までそのクライアントが保持する。
+//! Requests identify a bus and an operation. Validation runs before hardware is
+//! acquired so malformed or oversized operations fail without side effects.
 
 use crate::lock::BusId;
 use serde::{Deserialize, Serialize};
+
+pub const NATIVE_PROTOCOL_V1: u16 = 1;
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u16] = &[NATIVE_PROTOCOL_V1];
+pub const CAPABILITIES: &[&str] = &[
+    "protocol.capabilities",
+    "gpio.read",
+    "gpio.write",
+    "gpio.watch_edges",
+    "gpio.watch_edges_polled",
+    "i2c.read",
+    "i2c.write",
+    "i2c.write_read",
+    "spi.transfer",
+    "uart.read",
+    "uart.write",
+    "resource.release",
+];
 
 pub const DEFAULT_POLL_IDLE_TIMEOUT_US: u64 = 300;
 const MAX_TRANSFER_BYTES: usize = 1_048_576;
@@ -28,41 +33,30 @@ fn default_poll_idle_timeout_us() -> u64 {
     DEFAULT_POLL_IDLE_TIMEOUT_US
 }
 
+fn default_protocol_versions() -> Vec<u16> {
+    vec![NATIVE_PROTOCOL_V1]
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Request {
-    pub bus: BusRef,
+    #[serde(default)]
+    pub bus: Option<BusRef>,
     pub op: Operation,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BusRef {
-    Gpio {
-        pin: u32,
-    },
-    I2c {
-        bus: u8,
-        addr: u8,
-    },
-    Spi {
-        bus: u8,
-        chip_select: u8,
-    },
-    /// `port`は`/dev/ttyS{port}`に対応する（daemon側の命名規約、
-    /// `socket.rs`参照）。`baud_rate`はそのロック保持期間の初回オープン時に有効。
-    /// Releaseまたは切断時にポートをcloseし、次の所有者は指定値で開き直す。
-    Uart {
-        port: u8,
-        baud_rate: u32,
-    },
+    Gpio { pin: u32 },
+    I2c { bus: u8, addr: u8 },
+    Spi { bus: u8, chip_select: u8 },
+    Uart { port: u8, baud_rate: u32 },
 }
 
 impl From<&BusRef> for BusId {
     fn from(bus: &BusRef) -> Self {
         match *bus {
             BusRef::Gpio { pin } => BusId::Gpio(pin),
-            // addrはロック粒度に含めない。同じバスの別アドレスへのアクセスも
-            // トランザクション途中の割り込みから守るため、バス全体を排他する。
             BusRef::I2c { bus, .. } => BusId::I2c(bus),
             BusRef::Spi { bus, chip_select } => BusId::Spi(bus, chip_select),
             BusRef::Uart { port, .. } => BusId::Uart(port),
@@ -70,7 +64,6 @@ impl From<&BusRef> for BusId {
     }
 }
 
-/// GPIO入力のプルアップ/ダウン設定。`pi4gpio_hw::gpio::PullMode`のワイヤー版。
 #[derive(Debug, Deserialize, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PullWire {
@@ -83,8 +76,14 @@ pub enum PullWire {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
-    // GPIO用: 1ビット単位。`pull`省略時はNone（フィールドを省略できる
-    // クライアントとの互換のため`#[serde(default)]`）。
+    /// Read-only protocol negotiation. This operation is bus-free and never
+    /// acquires a hardware resource lock.
+    Hello {
+        #[serde(default = "default_protocol_versions")]
+        protocol_versions: Vec<u16>,
+        #[serde(default)]
+        requested_capabilities: Vec<String>,
+    },
     Read {
         #[serde(default)]
         pull: PullWire,
@@ -92,7 +91,6 @@ pub enum Operation {
     Write {
         value: bool,
     },
-    // I2C用: 方向が別々のバイト列（将来UARTでも流用予定）。
     ReadBytes {
         length: usize,
     },
@@ -103,15 +101,9 @@ pub enum Operation {
         data: Vec<u8>,
         length: usize,
     },
-    // SPI用: 送信と同時に同じ長さを受信する全二重転送。
     Transfer {
         data: Vec<u8>,
     },
-    // GPIO用（Tier 2）: エッジをタイムスタンプ付きで記録する。
-    // `pre_pulse_low_ms`を指定すると、監視開始前にそのピンをLOWに駆動して
-    // から`Some(ms)`ミリ秒待つ（DHT22等のスタート信号パターン）。`pull`は
-    // 監視中のSoC側プルアップ/ダウン（外部プルアップが無い回路向け、
-    // `pull`省略時はNone）。
     WatchEdges {
         pre_pulse_low_ms: Option<u64>,
         max_events: usize,
@@ -119,20 +111,11 @@ pub enum Operation {
         #[serde(default)]
         pull: PullWire,
     },
-    // GPIO用（Tier 1高速ポーリング版）: `/dev/gpiomem`の生レベルを
-    // busy-loopで連続サンプリングし、レベル変化をエッジとして記録する。
-    // カーネルGPIO v2の割り込みでは拾えない信号にも使える一方、CPUを占有し、
-    // ポーリング精度がタイムスタンプ粒度になる。`budget_ms`到達、または
-    // 最後の遷移から`idle_timeout_us`経過のいずれか早い方で打ち切る。
     WatchEdgesPolled {
         pre_pulse_low_ms: Option<u64>,
         budget_ms: u64,
-        /// 最後の遷移後、通信終了とみなすまでの無変化時間。省略時の300usは
-        /// 既存クライアントとの後方互換値であり、センサー固有要件では上書きする。
         #[serde(default = "default_poll_idle_timeout_us")]
         idle_timeout_us: u64,
-        /// この時間より短く元のレベルへ戻る変化をグリッチとして除外する。
-        /// 0（既定）は無効。対象信号の仕様が保証する最短パルスより短くする。
         #[serde(default)]
         glitch_filter_us: u64,
         #[serde(default)]
@@ -142,30 +125,33 @@ pub enum Operation {
 }
 
 impl Request {
-    /// ハードウェアを確保する前に、操作種別と資源消費量を検証する。
     pub fn validate(&self) -> Result<(), String> {
         let compatible = matches!(
-            (&self.bus, &self.op),
-            (_, Operation::Release)
-                | (BusRef::Gpio { .. }, Operation::Read { .. })
-                | (BusRef::Gpio { .. }, Operation::Write { .. })
-                | (BusRef::Gpio { .. }, Operation::WatchEdges { .. })
-                | (BusRef::Gpio { .. }, Operation::WatchEdgesPolled { .. })
-                | (BusRef::I2c { .. }, Operation::ReadBytes { .. })
-                | (BusRef::I2c { .. }, Operation::WriteBytes { .. })
-                | (BusRef::I2c { .. }, Operation::WriteReadBytes { .. })
-                | (BusRef::Spi { .. }, Operation::Transfer { .. })
-                | (BusRef::Uart { .. }, Operation::ReadBytes { .. })
-                | (BusRef::Uart { .. }, Operation::WriteBytes { .. })
+            (self.bus.as_ref(), &self.op),
+            (None, Operation::Hello { .. })
+                | (Some(_), Operation::Release)
+                | (Some(BusRef::Gpio { .. }), Operation::Read { .. })
+                | (Some(BusRef::Gpio { .. }), Operation::Write { .. })
+                | (Some(BusRef::Gpio { .. }), Operation::WatchEdges { .. })
+                | (
+                    Some(BusRef::Gpio { .. }),
+                    Operation::WatchEdgesPolled { .. }
+                )
+                | (Some(BusRef::I2c { .. }), Operation::ReadBytes { .. })
+                | (Some(BusRef::I2c { .. }), Operation::WriteBytes { .. })
+                | (Some(BusRef::I2c { .. }), Operation::WriteReadBytes { .. })
+                | (Some(BusRef::Spi { .. }), Operation::Transfer { .. })
+                | (Some(BusRef::Uart { .. }), Operation::ReadBytes { .. })
+                | (Some(BusRef::Uart { .. }), Operation::WriteBytes { .. })
         );
         if !compatible {
-            return Err("指定バスではこの操作を使用できません".to_string());
+            return Err("this operation is not supported for the selected bus".to_string());
         }
 
         let validate_length = |name: &str, length: usize| {
             if length == 0 || length > MAX_TRANSFER_BYTES {
                 Err(format!(
-                    "{name}は1..={MAX_TRANSFER_BYTES} bytesで指定してください"
+                    "{name} must contain 1..={MAX_TRANSFER_BYTES} bytes"
                 ))
             } else {
                 Ok(())
@@ -174,7 +160,7 @@ impl Request {
         let validate_pre_pulse = |value: Option<u64>| {
             if value.is_some_and(|ms| ms > MAX_OPERATION_MS) {
                 Err(format!(
-                    "pre_pulse_low_msは0..={MAX_OPERATION_MS}で指定してください"
+                    "pre_pulse_low_ms must be in 0..={MAX_OPERATION_MS}"
                 ))
             } else {
                 Ok(())
@@ -182,12 +168,24 @@ impl Request {
         };
 
         match &self.op {
+            Operation::Hello {
+                protocol_versions,
+                requested_capabilities,
+            } => {
+                if protocol_versions.is_empty() || protocol_versions.len() > 16 {
+                    return Err("protocol_versions must contain 1..=16 entries".to_string());
+                }
+                if requested_capabilities.len() > 256 {
+                    return Err("requested_capabilities exceeds 256 entries".to_string());
+                }
+                Ok(())
+            }
             Operation::ReadBytes { length } => validate_length("length", *length),
             Operation::WriteBytes { data } | Operation::Transfer { data } => {
-                validate_length("data長", data.len())
+                validate_length("data length", data.len())
             }
             Operation::WriteReadBytes { data, length } => {
-                validate_length("data長", data.len())?;
+                validate_length("data length", data.len())?;
                 validate_length("length", *length)
             }
             Operation::WatchEdges {
@@ -198,14 +196,10 @@ impl Request {
             } => {
                 validate_pre_pulse(*pre_pulse_low_ms)?;
                 if *max_events == 0 || *max_events > MAX_EDGE_EVENTS {
-                    return Err(format!(
-                        "max_eventsは1..={MAX_EDGE_EVENTS}で指定してください"
-                    ));
+                    return Err(format!("max_events must be in 1..={MAX_EDGE_EVENTS}"));
                 }
                 if *timeout_ms == 0 || *timeout_ms > MAX_OPERATION_MS {
-                    return Err(format!(
-                        "timeout_msは1..={MAX_OPERATION_MS}で指定してください"
-                    ));
+                    return Err(format!("timeout_ms must be in 1..={MAX_OPERATION_MS}"));
                 }
                 Ok(())
             }
@@ -218,19 +212,15 @@ impl Request {
             } => {
                 validate_pre_pulse(*pre_pulse_low_ms)?;
                 if *budget_ms == 0 || *budget_ms > MAX_OPERATION_MS {
-                    return Err(format!(
-                        "budget_msは1..={MAX_OPERATION_MS}で指定してください"
-                    ));
+                    return Err(format!("budget_ms must be in 1..={MAX_OPERATION_MS}"));
                 }
                 if *idle_timeout_us == 0 || *idle_timeout_us > MAX_POLL_IDLE_TIMEOUT_US {
                     return Err(format!(
-                        "idle_timeout_usは1..={MAX_POLL_IDLE_TIMEOUT_US}で指定してください"
+                        "idle_timeout_us must be in 1..={MAX_POLL_IDLE_TIMEOUT_US}"
                     ));
                 }
                 if *glitch_filter_us > *idle_timeout_us {
-                    return Err(
-                        "glitch_filter_usはidle_timeout_us以下で指定してください".to_string()
-                    );
+                    return Err("glitch_filter_us must not exceed idle_timeout_us".to_string());
                 }
                 Ok(())
             }
@@ -244,15 +234,32 @@ pub struct Response {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// GPIO読み取りの結果（High=true）等、単一値を伴う成功レスポンス用。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<bool>,
-    /// I2C読み取りの結果等、バイト列を伴う成功レスポンス用。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<Vec<u8>>,
-    /// `WatchEdges`の結果。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edges: Option<Vec<EdgeEventWire>>,
+    /// Present only for the bus-free `hello` operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<ProtocolInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProtocolInfo {
+    pub selected_version: Option<u16>,
+    pub supported_versions: &'static [u16],
+    pub available_capabilities: &'static [&'static str],
+    pub enabled_capabilities: Vec<&'static str>,
+    pub unavailable_capabilities: Vec<String>,
+    pub clock: ClockInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClockInfo {
+    pub source: &'static str,
+    pub unit: &'static str,
+    pub epoch: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,6 +276,7 @@ impl Response {
             value: None,
             bytes: None,
             edges: None,
+            protocol: None,
         }
     }
 
@@ -279,6 +287,7 @@ impl Response {
             value: Some(value),
             bytes: None,
             edges: None,
+            protocol: None,
         }
     }
 
@@ -289,6 +298,7 @@ impl Response {
             value: None,
             bytes: Some(data),
             edges: None,
+            protocol: None,
         }
     }
 
@@ -299,6 +309,7 @@ impl Response {
             value: None,
             bytes: None,
             edges: Some(events),
+            protocol: None,
         }
     }
 
@@ -309,6 +320,7 @@ impl Response {
             value: None,
             bytes: None,
             edges: None,
+            protocol: None,
         }
     }
 
@@ -319,6 +331,7 @@ impl Response {
             value: None,
             bytes: None,
             edges: None,
+            protocol: None,
         }
     }
 
@@ -329,6 +342,55 @@ impl Response {
             value: None,
             bytes: None,
             edges: None,
+            protocol: None,
+        }
+    }
+
+    pub fn hello(protocol_versions: &[u16], requested_capabilities: &[String]) -> Self {
+        let selected_version = protocol_versions
+            .iter()
+            .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+            .max()
+            .copied();
+        let enabled_capabilities = if requested_capabilities.is_empty() {
+            CAPABILITIES.to_vec()
+        } else {
+            CAPABILITIES
+                .iter()
+                .copied()
+                .filter(|capability| {
+                    requested_capabilities
+                        .iter()
+                        .any(|requested| requested == capability)
+                })
+                .collect()
+        };
+        let unavailable_capabilities = requested_capabilities
+            .iter()
+            .filter(|requested| !CAPABILITIES.contains(&requested.as_str()))
+            .cloned()
+            .collect();
+
+        Self {
+            ok: selected_version.is_some(),
+            error: selected_version
+                .is_none()
+                .then(|| "unsupported_protocol_version".to_string()),
+            value: None,
+            bytes: None,
+            edges: None,
+            protocol: Some(ProtocolInfo {
+                selected_version,
+                supported_versions: SUPPORTED_PROTOCOL_VERSIONS,
+                available_capabilities: CAPABILITIES,
+                enabled_capabilities,
+                unavailable_capabilities,
+                clock: ClockInfo {
+                    source: "CLOCK_MONOTONIC",
+                    unit: "nanoseconds",
+                    epoch: "unspecified_per_boot",
+                },
+            }),
         }
     }
 }
@@ -339,6 +401,42 @@ mod tests {
 
     fn request(json: &str) -> Request {
         serde_json::from_str(json).expect("request fixture must parse")
+    }
+
+    #[test]
+    fn hello_is_bus_free_and_negotiates_capabilities() {
+        let parsed = request(
+            r#"{"op":{"hello":{"protocol_versions":[1,2],"requested_capabilities":["gpio.read","wave.start"]}}}"#,
+        );
+        assert!(parsed.bus.is_none());
+        assert!(parsed.validate().is_ok());
+
+        let Operation::Hello {
+            protocol_versions,
+            requested_capabilities,
+        } = parsed.op
+        else {
+            panic!("wrong operation");
+        };
+        let encoded =
+            serde_json::to_value(Response::hello(&protocol_versions, &requested_capabilities))
+                .unwrap();
+        assert_eq!(encoded["protocol"]["selected_version"], 1);
+        assert_eq!(encoded["protocol"]["enabled_capabilities"][0], "gpio.read");
+        assert_eq!(
+            encoded["protocol"]["unavailable_capabilities"][0],
+            "wave.start"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_request_shape_is_unchanged() {
+        let parsed = request(r#"{"bus":{"type":"gpio","pin":17},"op":{"read":{"pull":"none"}}}"#);
+        assert!(matches!(
+            parsed.bus.as_ref(),
+            Some(BusRef::Gpio { pin: 17 })
+        ));
+        assert!(parsed.validate().is_ok());
     }
 
     #[test]

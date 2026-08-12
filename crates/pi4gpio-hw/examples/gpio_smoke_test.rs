@@ -1,9 +1,4 @@
-//! `pi4gpio-hw`のGPIO実装を実機で手動検証するためのサンプル。
-//! CIでは実行できない（実ハードウェアが必要）。
-//!
-//! 使い方: cargo run --release --example gpio_smoke_test -- <pin>
-//! 対象ピンは他の何にも使われていない未接続ピンであること
-//! （`gpioinfo`で consumer が無いことを事前に確認する）。
+//! Manual GPIO read/write smoke test for an otherwise unused pin.
 
 use pi4gpio_hw::gpio::{GpioChip, Level, PullMode};
 use pi4gpio_hw::HwError;
@@ -28,37 +23,36 @@ fn main() -> ExitCode {
 
     let mut failures = 0u32;
 
-    println!("[pull-up] claim_input(pin={pin}, Up) -> 未接続なら High のはず");
+    println!("[pull-up] claim_input(pin={pin}, Up) -> expected High when unconnected");
     let result = chip
         .claim_input(pin, PullMode::Up)
         .and_then(|()| chip.read(pin));
     check(&mut failures, result, Level::High);
 
-    println!("[pull-down] claim_input(pin={pin}, Down) -> 未接続なら Low のはず");
+    println!("[pull-down] claim_input(pin={pin}, Down) -> expected Low when unconnected");
     let result = chip
         .claim_input(pin, PullMode::Down)
         .and_then(|()| chip.read(pin));
     check(&mut failures, result, Level::Low);
 
-    println!("[output-high] claim_output + write(High) -> read で High が読み戻るはず");
+    println!("[output-high] claim_output + write(High) -> read should return High");
     let result = chip
         .claim_output(pin)
         .and_then(|()| chip.write(pin, Level::High))
         .and_then(|()| chip.read(pin));
     check(&mut failures, result, Level::High);
 
-    println!("[output-low] write(Low) -> read で Low が読み戻るはず");
+    println!("[output-low] write(Low) -> read should return Low");
     let result = chip.write(pin, Level::Low).and_then(|()| chip.read(pin));
     check(&mut failures, result, Level::Low);
 
-    // 後始末: 入力・プルなしに戻しておく。
     let _ = chip.claim_input(pin, PullMode::None);
 
     if failures == 0 {
-        println!("すべて成功");
+        println!("all checks passed");
         ExitCode::SUCCESS
     } else {
-        println!("{failures}件失敗");
+        println!("{failures} checks failed");
         ExitCode::FAILURE
     }
 }

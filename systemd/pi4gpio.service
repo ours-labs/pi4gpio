@@ -4,9 +4,15 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/pi4gpiod
-# Replace this example account if the target system uses a different service
-# identity. Grant only the device-group membership required by the deployment.
-User=pi
+# Create this unprivileged account during installation and grant only the
+# hardware groups required by the enabled interfaces.
+User=pi4gpio
+Group=pi4gpio
+SupplementaryGroups=gpio i2c spi dialout
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
 Restart=on-failure
 RestartSec=2
 RuntimeDirectory=pi4gpio
