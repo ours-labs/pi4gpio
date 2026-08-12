@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pi4gpio-client"
+version = "0.1.1"
+description = "Python client for the local pi4gpiod Unix-socket API"
+authors = [{name = "Kazuki Kumahata"}]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+keywords = ["raspberry-pi", "gpio", "spi", "i2c", "uart", "hardware", "ipc"]
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Hardware",
+    "Intended Audience :: Developers",
+]
+
+[project.urls]
+Homepage = "https://github.com/ours-labs/pi4gpio"
+Issues = "https://github.com/ours-labs/pi4gpio/issues"
+
+[tool.setuptools.packages.find]
+include = ["pi4gpio_client*"]
+
+[tool.setuptools.package-data]
+pi4gpio_client = ["py.typed"]

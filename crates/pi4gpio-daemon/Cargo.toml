@@ -1,0 +1,16 @@
+[package]
+name = "pi4gpio-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pi4gpiod"
+path = "src/main.rs"
+
+[dependencies]
+pi4gpio-hw = { path = "../pi4gpio-hw" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "io-util"] }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

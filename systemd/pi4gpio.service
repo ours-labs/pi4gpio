@@ -1,0 +1,16 @@
+[Unit]
+Description=pi4gpio - shared GPIO/SPI/I2C/UART access daemon for Raspberry Pi 4
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/pi4gpiod
+# Replace this example account if the target system uses a different service
+# identity. Grant only the device-group membership required by the deployment.
+User=pi
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=pi4gpio
+RuntimeDirectoryMode=0770
+
+[Install]
+WantedBy=multi-user.target
