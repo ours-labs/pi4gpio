@@ -1,5 +1,7 @@
 # Pi4gpio
 
+English | [日本語](README.ja.md)
+
 Pi4gpio is a local hardware-access daemon for Raspberry Pi 4. It provides a shared API for GPIO, I2C, SPI, and UART while enforcing per-client resource ownership.
 
 ## Released capabilities
